@@ -129,12 +129,7 @@
             {% endif %}
             <p>&nbsp;</p>
             <label for="download_rss">Download RSS feeds:</label>
-            {% if settings.get('downloads', 'seed_torrent') == '1' %}
-                <input type="checkbox" class="form-control bootstrap_switch" name="download_rss" data-size="small"
-                       checked>
-            {% else %}
                 <input type="checkbox" class="form-control bootstrap_switch" name="download_rss" data-size="small">
-            {% endif %}
             <p>&nbsp;</p>
             <label for="remove_cloud">Remove torrents from cloud after downloading:</label>
             {% if settings.get('downloads', 'remove_cloud') == '1' %}
@@ -146,14 +141,6 @@
             <label for="remove_cloud_delay">Delay in hours:</label>
             <input type="number" class="form-control" name="remove_cloud_delay"
                    aria-describedby="basic-addon1" value="{{ settings.get('downloads', 'remove_cloud_delay') }}">
-            <p>&nbsp;</p>
-            <label for="seed_torrent">Seed private tracker torrents:</label>
-            {% if settings.get('downloads', 'seed_torrent') == '1' %}
-                <input type="checkbox" class="form-control bootstrap_switch" name="seed_torrent" data-size="small"
-                       checked>
-            {% else %}
-                <input type="checkbox" class="form-control bootstrap_switch" name="seed_torrent" data-size="small">
-            {% endif %}
             <p>&nbsp;</p>
         </div>
 
@@ -281,11 +268,39 @@
             <p>&nbsp;</p>
             <p>Subfolders will be created based on categories names</p>
             <p>Downloads will automatically set category based on subfolder name</p>
-            <label for="watchdir_location">Folder to Watch:</label>
-            <input type="text" class="form-control" name="watchdir_location"
+            <div class="form-inline">
+                <label for="watchdir_location">Folder to Watch:</label>
+                <input type="text" class="form-control" name="watchdir_location"
                    aria-describedby="basic-addon1" value="{{ settings.get('upload', 'watchdir_location') }}">
+                <label for="tag_movies">Movie folder name:</label>
+                <input type="text" class="form-control" name="tag_movies"
+                    aria-describedby="basic-addon1" value="{{ settings.get('upload', 'tag_movies') }}">
+                <label for="tag_tv">TV folder name:</label>
+                <input type="text" class="form-control" name="tag_tv"
+                    aria-describedby="basic-addon1" value="{{ settings.get('upload', 'tag_tv') }}">
+            </div>
+			<label for="watchdir_backup">Blackhole files backup:</label>
+            <input type="text" class="form-control" name="watchdir_backup"
+                   aria-describedby="basic-addon1" value="{{ settings.get('upload', 'watchdir_backup') }}">
         </div>
         <p>&nbsp;</p>
+
+        <div class="well well-sm">
+            <h2>Cloud Folders</h2>
+        </div>
+        <div class="form-group">
+            <label for="remote_movies_folder">Cloud Movie folder (id):</label>
+            <input type="text" class="form-control" name="remote_movies_folder_name"
+                aria-describedby="basic-addon1" value="{{ settings.get('upload', 'remote_movies_folder_name') }}">
+            <label for="remote_cams_folder">Cloud CAMS folder (id):</label>
+            <input type="text" class="form-control" name="remote_cams_folder_name"
+                aria-describedby="basic-addon1" value="{{ settings.get('upload', 'remote_cams_folder_name') }}">
+            <label for="remote_tv_folder">Cloud TV folder (id):</label>
+            <input type="text" class="form-control" name="remote_tv_folder_name"
+                aria-describedby="basic-addon1" value="{{ settings.get('upload', 'remote_tv_folder_name') }}">
+        </div>
+        <p>&nbsp;</p>
+
 
         <div class="well well-sm">
             <h2>Notifications</h2>
