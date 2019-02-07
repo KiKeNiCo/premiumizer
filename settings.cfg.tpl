@@ -25,7 +25,6 @@ download_max = 1
 download_speed = -1
 remove_cloud = 0
 remove_cloud_delay = 0
-seed_torrent = 0
 download_location =
 nzbtomedia_location = [Change to path]\nzbToMedia.py
 jd_enabled = 0
@@ -74,6 +73,15 @@ cat_nzbtomedia[6] = 0
 [upload]
 watchdir_enabled = 0
 watchdir_location =
+watchdir_backup =
+tag_movies =
+tag_tv =
+remote_movies_folder_name =
+remote_movies_folder =
+remote_cams_folder_name = 
+remote_cams_folder =
+remote_tv_folder_name =
+remote_tv_folder =
 
 
 [notifications]

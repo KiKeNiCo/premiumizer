@@ -1,8 +1,10 @@
 #! /usr/bin/env python
+import base64
 import ConfigParser
 import json
 import logging
 import os
+import pickle
 import re
 import shelve
 import shutil
@@ -40,6 +42,8 @@ from watchdog.observers import Observer
 from werkzeug.utils import secure_filename
 
 from DownloadTask import DownloadTask
+from tabnanny import filename_only
+from pip._vendor.distlib import database
 
 # "https://www.premiumize.me/api"
 print ('------------------------------------------------------------------------------------------------------------')
@@ -52,6 +56,8 @@ prem_config = ConfigParser.RawConfigParser()
 runningdir = os.path.split(os.path.abspath(os.path.realpath(sys.argv[0])))[0]
 rootdir = os.path.split(runningdir)
 os_arg = ''
+tempdir = 'tmp'
+db_cache_file = 'db_cache.txt'
 
 if len(sys.argv) > 1:
     os_arg = sys.argv[1]
@@ -219,7 +225,6 @@ class PremConfig:
         self.prem_pin = prem_config.get('premiumize', 'pin')
         self.remove_cloud = prem_config.getboolean('downloads', 'remove_cloud')
         self.remove_cloud_delay = prem_config.getint('downloads', 'remove_cloud_delay')
-        self.seed_torrent = prem_config.getboolean('downloads', 'seed_torrent')
         self.download_all = prem_config.getboolean('downloads', 'download_all')
         self.download_enabled = prem_config.getboolean('downloads', 'download_enabled')
         self.download_location = prem_config.get('downloads', 'download_location')
@@ -292,12 +297,27 @@ class PremConfig:
             self.nzbtomedia_builtin = 1
         else:
             self.nzbtomedia_location = prem_config.get('downloads', 'nzbtomedia_location')
+            
         self.watchdir_enabled = prem_config.getboolean('upload', 'watchdir_enabled')
         self.watchdir_location = prem_config.get('upload', 'watchdir_location')
+        self.watchdir_backup = prem_config.get('upload', 'watchdir_backup')
         if self.watchdir_enabled:
             logger.info('Watchdir is enabled at: %s', self.watchdir_location)
+            logger.info('Watchdir backup is enabled at: %s', self.watchdir_backup)
             if not os.path.exists(self.watchdir_location):
                 os.makedirs(self.watchdir_location)
+            if not os.path.exists(self.watchdir_backup):
+                os.makedirs(self.watchdir_backup)
+        
+        self.tag_movies = prem_config.get('upload', 'tag_movies')   
+        self.tag_tv = prem_config.get('upload', 'tag_tv')
+        self.remote_movies_folder_name = prem_config.get('upload', 'remote_movies_folder_name')    
+        self.remote_movies_folder = prem_config.get('upload', 'remote_movies_folder')
+        self.remote_cams_folder_name = prem_config.get('upload', 'remote_cams_folder_name')
+        self.remote_cams_folder = prem_config.get('upload', 'remote_cams_folder')
+        self.remote_tv_folder_name = prem_config.get('upload', 'remote_tv_folder_name')
+        self.remote_tv_folder = prem_config.get('upload', 'remote_tv_folder')
+        
 
         self.categories = []
         self.download_categories = ''
@@ -590,9 +610,11 @@ def ek(original, *args):
 #
 def clean_name(original):
     logger.debug('def clean_name started')
-    valid_chars = "-_.,()[]{}&!@ %s%s" % (ascii_letters, digits)
+    valid_chars = "-_.+,()[]{}&!@ %s%s" % (ascii_letters, digits)
     cleaned_filename = unicodedata.normalize('NFKD', to_unicode(original)).encode('ASCII', 'ignore')
     valid_string = ''.join(c for c in cleaned_filename if c in valid_chars)
+    valid_string = re.sub('[+]', ' ', valid_string)
+    valid_string = re.sub('[.]', ' ', valid_string)
     return ' '.join(valid_string.split())
 
 
@@ -1168,7 +1190,7 @@ def download_task(task):
     else:
         task.update(local_status='finished')
 
-    scheduler.scheduler.reschedule_job('update', trigger='interval', seconds=1)
+    #scheduler.scheduler.reschedule_job('update', trigger='interval', seconds=1)
 
 
 def prem_connection(method, url, payload, files=None):
@@ -1299,7 +1321,7 @@ def parse_tasks(transfers):
             task.update(progress=progress, cloud_status=transfer['status'], dlsize=size + ' --- ',
                         speed=speed + ' --- ', eta=eta, file_id=file_id)
         if task.local_status is None:
-            if task.cloud_status != 'finished' and task.cloud_status != 'seeding':
+            if task.cloud_status != 'finished':
                 if task.name is not None and task.name != 'Loading name':
                     name = task.name
                 elif task.name == 'Loading name' and transfer['name'] is not None and transfer['name'] != 0:
@@ -1311,7 +1333,7 @@ def parse_tasks(transfers):
                 task.update(progress=progress, cloud_status=transfer['status'], name=name, dlsize=size + ' --- ',
                             speed=speed + ' --- ', eta=eta, folder_id=folder_id, file_id=file_id)
                 idle = False
-            elif task.cloud_status == 'finished' or task.cloud_status == 'seeding':
+            elif task.cloud_status == 'finished':
                 if cfg.download_enabled:
                     if task.category == '':
                         if cfg.download_rss and transfer['folder_id']:
@@ -1440,6 +1462,8 @@ def add_task(id, size, name, category, type='', folder_id=None):
                 type = 'NZB'
         except:
             pass
+        
+        
         task = DownloadTask(socketio.emit, id.encode("utf-8"), folder_id, size, name, category, dldir, dlext,
                             delsample, dlnzbtomedia, type)
         tasks.append(task)
@@ -1449,57 +1473,288 @@ def add_task(id, size, name, category, type='', folder_id=None):
         task = 'duplicate'
     return task
 
+def create_payload():
+    payload = {'customer_id': cfg.prem_customer_id, 'pin': cfg.prem_pin}
+    return payload
 
-def upload_torrent(torrent):
+def clear_payload(payload):
+    payload.clear()
+    payload = create_payload()
+    return payload
+
+    
+def folder_list_parsed(remote_folder_id=None):
+    payload = create_payload()
+    payload['id'] = remote_folder_id                       
+    r = prem_connection("post", "https://www.premiumize.me/api/folder/list", payload)
+    payload = clear_payload(payload)
+    if 'failed' not in r:
+        if 'content' in r.content:  
+            dir_content = json.loads(r.content)['content']
+            if dir_content: 
+                result = {'remote_folder_id': remote_folder_id, 'dir_content': dir_content}
+                logger.info('CONTENT IN -- %s ', result['remote_folder_id'])
+                return result
+            else:
+                return None
+        else:
+            return None
+    else:
+        return None
+
+def list_remote_folder(remote_folder_id, database=[]):
+    list_parsed = folder_list_parsed(remote_folder_id)
+    if list_parsed == None:
+        return database
+    for x in list_parsed['dir_content']:
+        if x['type'] == 'folder':
+            dir = {'name': x['name'], 'folder_id': x['id']}
+            database.append(dir)
+            logger.info('DB ADD -- %s -- %s -- %s', x['name'], x ['id'], x['type'])
+            database = list_remote_folder(x['id'], database)
+    return database
+
+def parse_tvshow_name(filename):
+    filename = re.split(r'.S[0-9][0-9]?', filename, re.IGNORECASE)[0]
+    filename = re.split(r'[0-9][0-9]?x[0-9][0-9]?', filename, re.IGNORECASE)[0]
+    filename = re.sub('[.]', ' ', filename)
+    i = re.search('[A-Z][a-z]*', filename).start()
+    filename = filename[i:]
+    return filename
+
+def file_real_name(file):
+    if file.endswith('.torrent'):
+        name = torrent_metainfo(file)
+    elif file.endswith('.magnet'):
+        with open(file) as f:
+            magnet = f.read()
+            if not magnet:
+                logger.error('Magnet file empty? for: %s', file)
+                return
+            else:
+                try:
+                    name = re.search('&dn=(.+?)(&|.torrent)', magnet).group(1)
+                except AttributeError:
+                    logger.error('Extracting id / name from .magnet failed for: %s', file)
+                    return
+    elif file.endswith('.nzb'):
+        name = os.path.basename(file)
+        name = os.path.splitext(name)[0]
+        
+    try:
+        name = urllib.unquote(name).decode('ASCII')
+        name = clean_name(name)
+        if 'download.php?id=' in name:
+            name = name.split("&f=", 1)[1]
+        if name.endswith('.torrent'):
+            name = name.split('.torrent', 1)[0]
+        elif name.endswith('.nzb'):
+            name = name.split('.nzb', 1)[0]
+    except:
+        pass
+    return name
+
+def search_remote(filename, remote_folder_id):
+    payload = create_payload()
+    payload['id'] = remote_folder_id
+    r = prem_connection("post", "https://www.premiumize.me/api/folder/list", payload)
+    payload = clear_payload(payload)
+    if 'failed' in r:
+        logger.info('SEARCH FAIL')
+    else:
+        logger.info('SEARCH IN')
+        dir_content = json.loads(r.content)['content']
+        logger.info('SEARCH LOADED IN')
+        if dir_content:
+            for x in dir_content:
+                logger.info('L:  -- %s', filename)
+                name = clean_name(x['name'])
+                logger.info('RC: -- %s', name)
+                if filename == name:
+                    logger.info('EXISTS')
+                    status = 'exists'
+                    match_folder_id = x['id']
+                    break
+                else:
+                    logger.info('MISSING')
+                    status = 'missing'
+                    match_folder_id = None      
+        else:
+            logger.info('MISSING')
+            status = 'missing'
+            match_folder_id = None      
+        result = {'status': status, 'name': filename, 'folder_id': match_folder_id}
+        return result
+
+def create_remote_folder(name, parent_id=None):
+    exists_folder = search_remote(name, cfg.remote_tv_folder)
+    if exists_folder['status'] == 'missing':
+        payload = create_payload()
+        payload['name'] = name
+        payload['parent_id'] = parent_id
+        r = prem_connection("post", "https://www.premiumize.me/api/folder/create", payload)
+        payload = clear_payload(payload)
+        match_folder_id = json.loads(r.content)['id']
+        logger.info('CF MISSING')
+        logger.info('Folder created: -- %s -- with ID: -- %s --', name, match_folder_id)
+    else:
+        logger.info('CF EXISTS')
+        match_folder_id = exists_folder['folder_id']
+        logger.info('Folder Exists: -- %s -- with ID: -- %s --', name, match_folder_id)
+    return match_folder_id
+
+def sort_media(filename):
+    dirname = os.path.basename(os.path.normpath(os.path.dirname(filename)))
+    filename_only = os.path.normpath(os.path.basename(filename))
+    logger.info('Filename_only: -- %s -- dir_name: -- %s --', filename_only, dirname)
+    cam_quality = ['HDTS', 'CAM', 'HDCAM', 'HDTC', 'DVDSCR']
+    hd_quality = ['x264', 'x265', 'H264', 'BluRay', 'Blu-Ray', 'DVD', 'BDRIP', 'BRRIP', 'WEBRip', 'WEB-DL', 'BDRip']
+    cam = []
+    hd = []
+    for quality in cam_quality:
+        cam.append(re.compile(quality, re.IGNORECASE))
+    for quality in hd_quality:
+        hd.append(re.compile(quality, re.IGNORECASE))
+    movie = cam + hd
+    
+    
+    payload = create_payload()
+    
+    if re.search(dirname, cfg.tag_tv, re.IGNORECASE) or re.search(r'S[0-9][0-9]?',filename_only, re.IGNORECASE) or re.search(r'[0-9][0-9]?x[0-9][0-9]?',filename_only, re.IGNORECASE):
+        remote_folder_name = 'TV Shows'
+        
+        filename_only = parse_tvshow_name(filename_only)
+        match_folder_id = create_remote_folder(filename_only, cfg.remote_tv_folder)   
+        payload['folder_id'] = match_folder_id
+        logger.info('Folder to use %s', payload['folder_id'])
+                
+        if not filename_only.endswith('.torrent') and not filename_only.endswith('.nzb'):
+            payload['src'] = filename            
+    else:
+        if re.search(dirname, cfg.tag_movies, re.IGNORECASE) or any(quality.search(filename_only) for quality in movie):         
+            if any(quality.search(filename_only) for quality in cam):
+                remote_folder_name = 'CAMs'
+                payload['folder_id'] = cfg.remote_cams_folder
+                if not filename_only.endswith('.torrent') and not filename_only.endswith('.nzb'):
+                    payload['src'] = filename
+            else: 
+                remote_folder_name = 'HD Movies'
+                payload['folder_id'] = cfg.remote_movies_folder
+                if not filename_only.endswith('.torrent') and not filename_only.endswith('.nzb'):
+                    payload['src'] = filename
+        else:
+            remote_folder_name = 'General'
+            payload['folder_id'] = None
+            if not filename_only.endswith('.torrent') and not filename_only.endswith('.nzb'):
+                payload['src'] = filename
+    
+    logger.info('File exists????')
+    logger.info('before parse %s', filename)            
+    file_name = file_real_name(filename)
+    logger.info('after parse %s', file_name)
+    exists_file = search_remote(file_name, payload['folder_id'])
+    if exists_file['status'] == 'exists':
+        payload = None
+    else:
+        logger.info('Added: -- %s -- to remote folder: -- %s --', filename_only, payload['folder_id'])
+    return payload
+
+
+def upload_torrent(torrent):    
     logger.debug('def upload_torrent started')
-    if cfg.seed_torrent:
-        payload = {'customer_id': cfg.prem_customer_id, 'pin': cfg.prem_pin, 'seed': '2or48h'}
-    else:
-        payload = {'customer_id': cfg.prem_customer_id, 'pin': cfg.prem_pin}
-    files = {'src': open(torrent, 'rb')}
-    logger.debug('Uploading torrent to the cloud: %s', torrent)
-    r = prem_connection("postfile", "https://www.premiumize.me/api/transfer/create", payload, files)
-    if 'failed' not in r:
-        response_content = json.loads(r.content)
-        if response_content['status'] == "success":
-            logger.debug('Upload successful: %s', torrent)
-            return response_content['id']
+    payload = sort_media(torrent)
+    if payload is not None:
+        files = {'src': open(torrent, 'rb')}
+        logger.debug('Uploading torrent to the cloud: %s', torrent)
+        r = prem_connection("postfile", "https://www.premiumize.me/api/transfer/create", payload, files)
+        if 'failed' not in r:
+            response_content = json.loads(r.content)
+            if response_content['status'] == "success":
+                logger.debug('Upload successful: %s', torrent)
+                return response_content['id']
+            else:
+                msg = 'Upload of torrent: %s failed, message: %s' % (torrent, response_content['message'])
+                logger.error(msg)
+                if response_content['message'] == 'You already have this job added.':
+                    return 'duplicate'
+                if cfg.email_enabled:
+                    email('Upload of torrent failed', msg)
+                return 'failed'
         else:
-            msg = 'Upload of torrent: %s failed, message: %s' % (torrent, response_content['message'])
-            logger.error(msg)
-            if response_content['message'] == 'You already have this job added.':
-                return 'duplicate'
-            if cfg.email_enabled:
-                email('Upload of torrent failed', msg)
             return 'failed'
     else:
-        return 'failed'
+        logger.info('File: -- %s -- already exists.', file_real_name(torrent))
+        return 'exists'
 
 
-def upload_magnet(magnet):
+def upload_magnet(magnet, magnet_filename=None):
     logger.debug('def upload_magnet started')
-    if cfg.seed_torrent:
-        payload = {'customer_id': cfg.prem_customer_id, 'pin': cfg.prem_pin, 'seed': '2or48h', 'src': magnet}
+    if magnet_filename is not None:
+        payload = sort_media(magnet_filename)
     else:
-        payload = {'customer_id': cfg.prem_customer_id, 'pin': cfg.prem_pin, 'src': magnet}
-    r = prem_connection("post", "https://www.premiumize.me/api/transfer/create", payload)
-    if 'failed' not in r:
-        response_content = json.loads(r.content)
-        if response_content['status'] == "success":
-            logger.debug('Upload magnet successful')
-            return response_content['id']
+        payload = create_payload()
+    if payload is not None:
+        payload['src'] = magnet
+        r = prem_connection("post", "https://www.premiumize.me/api/transfer/create", payload)
+        if 'failed' not in r:
+            response_content = json.loads(r.content)
+            if response_content['status'] == "success":
+                logger.debug('Upload magnet successful')
+                return response_content['id']
+            else:
+                msg = 'Upload of magnet: %s failed, message: %s' % (magnet, response_content['message'])
+                logger.error(msg)
+                if response_content['message'] == 'You already have this job added.':
+                    return 'duplicate'
+                if cfg.email_enabled:
+                    email('Upload of magnet failed', msg)
+                return 'failed'
         else:
-            msg = 'Upload of magnet: %s failed, message: %s' % (magnet, response_content['message'])
-            logger.error(msg)
-            if response_content['message'] == 'You already have this job added.':
-                return 'duplicate'
-            if cfg.email_enabled:
-                email('Upload of magnet failed', msg)
             return 'failed'
     else:
-        return 'failed'
+        logger.info('File: -- %s -- already exists.', file_real_name(magnet_filename))        
+        db_search_by('name','Test 2')
+        return 'exists'
 
+def db_dump(remote_folder_id=None):
+    tmp = os.path.join(runningdir, tempdir)
+    if not os.path.isdir(tmp):
+        os.makedirs(tmp)
+    db_file = os.path.join(tmp, db_cache_file)
+    if not os.path.isfile(db_file):
+        database = list_remote_folder(remote_folder_id)
+        if len(database) is not 0:
+            database = base64.b64encode(json.dumps(database))
+            json.dump(database, open(db_file,'w'))
+            logger.info('DB file %s created', db_file, )
+        else:
+            logger.info('Empty folder')
+    else:
+        logger.info('DB file %s already exists', db_file)
 
+def db_search_by(type, search):
+    tmp = os.path.join(runningdir, tempdir)
+    if not os.path.isdir(tmp):
+        logger.info('No Database')
+        return None
+    db_file = os.path.join(tmp, db_cache_file)
+    with open(db_file) as db:
+        database = db.read()
+    database = base64.b64decode(database)
+    database = json.loads(database)
+    if type == 'id':
+        found = [db_item['name'] for db_item in database if db_item['folder_id'] == search]
+    else:
+        if type == 'name':
+            found = [db_item['folder_id'] for db_item in database if db_item['name'] == search]
+    
+    if len(found) is not 0:
+        logger.info('DB SEARCH-- %s', found[0])
+        return found[0]
+    else:
+        logger.info('NOT FOUND')
+        return None
+    
 def upload_filehost(urls):
     logger.debug('def upload_filehost started')
     download_list = []
@@ -1549,25 +1804,29 @@ def upload_filehost(urls):
 
 def upload_nzb(filename):
     logger.debug('def upload_nzb started')
-    payload = {'customer_id': cfg.prem_customer_id, 'pin': cfg.prem_pin}
-    files = {'src': open(filename, 'rb')}
-    logger.debug('Uploading nzb to the cloud: %s', filename)
-    r = prem_connection("postfile", "https://www.premiumize.me/api/transfer/create", payload, files)
-    if 'failed' not in r:
-        response_content = json.loads(r.content)
-        if response_content['status'] == "success":
-            logger.debug('Upload nzb successful: %s', filename)
-            return response_content['id']
+    payload = sort_media(filename)
+    if payload is not None:
+        files = {'src': open(filename, 'rb')}
+        logger.debug('Uploading nzb to the cloud: %s', filename)
+        r = prem_connection("postfile", "https://www.premiumize.me/api/transfer/create", payload, files)
+        if 'failed' not in r:
+            response_content = json.loads(r.content)
+            if response_content['status'] == "success":
+                logger.debug('Upload nzb successful: %s', filename)
+                return response_content['id']
+            else:
+                msg = 'Upload of nzb: %s failed, message: %s' % (filename, response_content['message'])
+                logger.error(msg)
+                if response_content['message'] == 'You already have this job added.':
+                    return 'duplicate'
+                if cfg.email_enabled:
+                    email('Upload of nzb failed', msg)
+                return 'failed'
         else:
-            msg = 'Upload of nzb: %s failed, message: %s' % (filename, response_content['message'])
-            logger.error(msg)
-            if response_content['message'] == 'You already have this job added.':
-                return 'duplicate'
-            if cfg.email_enabled:
-                email('Upload of nzb failed', msg)
             return 'failed'
     else:
-        return 'failed'
+        logger.info('File: -- %s -- already exists.', file_real_name(filename))
+        return 'exists'
 
 
 def send_categories():
@@ -1595,7 +1854,7 @@ class MyHandler(events.PatternMatchingEventHandler):
                 category = ''
             if watchdir_file.endswith('.torrent'):
                 id = upload_torrent(watchdir_file)
-                if id == 'duplicate':
+                if id == 'duplicate' or id == 'exists':
                     failed = 1
                     logger.debug('Deleting duplicate file from watchdir: %s', watchdir_file)
                     try:
@@ -1622,8 +1881,8 @@ class MyHandler(events.PatternMatchingEventHandler):
                         except AttributeError:
                             logger.error('Extracting id / name from .magnet failed for: %s', watchdir_file)
                             return
-                        id = upload_magnet(magnet)
-                        if id == 'duplicate':
+                        id = upload_magnet(magnet, watchdir_file)
+                        if id == 'duplicate' or id == 'exists':
                             failed = 1
                             logger.debug('Deleting duplicate file from watchdir: %s', watchdir_file)
                             try:
@@ -1642,7 +1901,7 @@ class MyHandler(events.PatternMatchingEventHandler):
 
             elif watchdir_file.endswith('.nzb'):
                 id = upload_nzb(watchdir_file)
-                if id == 'duplicate':
+                if id == 'duplicate' or id == 'exists':
                     failed = 1
                     logger.debug('Deleting duplicate file from watchdir: %s', watchdir_file)
                     try:
@@ -1659,6 +1918,13 @@ class MyHandler(events.PatternMatchingEventHandler):
                     type = 'NZB'
                     add_task(id, 0, name, category, type=type)
             if not failed:
+                gevent.sleep(3)
+                filename = os.path.basename(watchdir_file)
+                backupfolder = os.path.join(cfg.watchdir_backup, dirname)
+                if not os.path.isdir(backupfolder):
+                    os.makedirs(backupfolder)
+                shutil.copy(watchdir_file, os.path.join(backupfolder, filename))
+                logger.debug('Backup file from watchdir: %s', watchdir_file)
                 gevent.sleep(3)
                 logger.debug('Deleting file from watchdir: %s', watchdir_file)
                 try:
@@ -1727,6 +1993,7 @@ def home():
         download_speed = utils.sizeof_human(cfg.download_speed)
     else:
         download_speed = cfg.download_speed
+       
     return render_template('index.html', download_speed=download_speed, debug_enabled=debug_enabled, cfg=cfg)
 
 
@@ -1749,7 +2016,7 @@ def upload():
         if upload_file.endswith('.magnet'):
             with open(upload_file) as f:
                 magnet = f.read()
-                failed = upload_magnet(magnet)
+                failed = upload_magnet(magnet, upload_file)
         if failed != 'failed':
             try:
                 os.remove(upload_file)
@@ -1888,10 +2155,6 @@ def settings():
                 prem_config.set('downloads', 'remove_cloud', '1')
             else:
                 prem_config.set('downloads', 'remove_cloud', '0')
-            if request.form.get('seed_torrent'):
-                prem_config.set('downloads', 'seed_torrent', '1')
-            else:
-                prem_config.set('downloads', 'seed_torrent', '0')
             if request.form.get('jd_enabled'):
                 prem_config.set('downloads', 'jd_enabled', '1')
                 prem_config.set('downloads', 'aria2_enabled', '0')
@@ -1951,6 +2214,17 @@ def settings():
             prem_config.set('downloads', 'download_speed', request.form.get('download_speed'))
             prem_config.set('downloads', 'remove_cloud_delay', request.form.get('remove_cloud_delay'))
             prem_config.set('upload', 'watchdir_location', request.form.get('watchdir_location'))
+            
+            prem_config.set('upload', 'tag_movies', request.form.get('tag_movies'))
+            prem_config.set('upload', 'tag_tv', request.form.get('tag_tv'))
+            prem_config.set('upload', 'watchdir_backup', request.form.get('watchdir_backup'))
+            prem_config.set('upload', 'remote_movies_folder_name', request.form.get('remote_movies_folder_name'))
+            prem_config.set('upload', 'remote_movies_folder', db_search_by('name', request.form.get('remote_movies_folder_name')))
+            prem_config.set('upload', 'remote_cams_folder_name', request.form.get('remote_cams_folder_name'))
+            prem_config.set('upload', 'remote_cams_folder', db_search_by('name', request.form.get('remote_cams_folder_name')))
+            prem_config.set('upload', 'remote_tv_folder_name', request.form.get('remote_tv_folder_name'))
+            prem_config.set('upload', 'remote_tv_folder', db_search_by('name', request.form.get('remote_tv_folder_name')))
+            
             prem_config.set('downloads', 'nzbtomedia_location', request.form.get('nzbtomedia_location'))
             for x in range(1, 6):
                 prem_config.set('categories', ('cat_name' + str([x])), request.form.get('cat_name' + str([x])))
@@ -2186,6 +2460,7 @@ def change_category(message):
 # start the server with the 'run()' method
 logger.info('Starting server on %s:%s ', prem_config.get('global', 'bind_ip'),
             prem_config.getint('global', 'server_port'))
+
 if __name__ == '__main__':
     try:
         load_tasks()
@@ -2201,9 +2476,12 @@ if __name__ == '__main__':
         if not os_arg == '--docker':
             scheduler.scheduler.add_job(check_update, 'interval', id='check_update', seconds=1, replace_existing=True,
                                         max_instances=1, coalesce=True)
+        db_dump()
+        
         if cfg.watchdir_enabled:
             gevent.spawn_later(2, watchdir)
         socketio.run(app, host=prem_config.get('global', 'bind_ip'), port=prem_config.getint('global', 'server_port'),
                      use_reloader=False)
     except:
         raise
+
